@@ -61,6 +61,25 @@ Write tweets that feel posted right after staring at charts too long.
 """
 
 # =========================
+# Helpers
+# =========================
+def normalize_post_text(result: Any) -> str:
+    """
+    Ensures post_text is always a string.
+    Handles dict, string, or broken LLM output.
+    """
+    if isinstance(result, str):
+        return result
+
+    if isinstance(result, dict):
+        for key in ("post", "text", "content", "tweet"):
+            value = result.get(key)
+            if isinstance(value, str):
+                return value
+
+    return random.choice(FALLBACK_TWEETS)
+
+# =========================
 # AutoPost Service
 # =========================
 class AutoPostService:
@@ -70,7 +89,7 @@ class AutoPostService:
         self.twitter = TwitterClient()
         self.tier_manager = tier_manager
 
-    async def safe_chat(self, messages: list[dict]) -> str | None:
+    async def safe_chat(self, messages: list[dict]) -> Any:
         """LLM call that never crashes autopost."""
         try:
             return await self.llm.chat(messages)
@@ -119,11 +138,9 @@ Output ONLY the tweet text.
             # -------------------------
             # Generate tweet
             # -------------------------
-            post_text = await self.safe_chat(messages)
+            raw_result = await self.safe_chat(messages)
 
-            if not post_text:
-                post_text = random.choice(FALLBACK_TWEETS)
-
+            post_text = normalize_post_text(raw_result)
             post_text = post_text.strip()[:MAX_CHARS].rstrip()
 
             # -------------------------
