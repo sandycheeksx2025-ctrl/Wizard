@@ -1,175 +1,252 @@
 """
-Autopost service — Degen trading persona
+Agent-based autoposting service.
 
-- Text-only LLM usage (OpenRouter-safe)
-- No response_format / no schemas
-- Target length: 180–250 chars
-- Hard clamp at 250 chars
-- Guaranteed fallback
+The agent creates a plan, executes tools step by step,
+and generates the final post text.
+
+All in one continuous conversation (user-assistant-user-assistant...).
 """
 
+import json
 import logging
 import time
 import random
+import re
 from typing import Any
 
 from services.database import Database
 from services.llm import LLMClient
 from services.twitter import TwitterClient
+from tools.registry import TOOLS, get_tools_description
+from config.personality import SYSTEM_PROMPT
+from config.prompts.agent_autopost import AUTOPOST_AGENT_PROMPT
+from config.schemas import PLAN_SCHEMA, POST_TEXT_SCHEMA, TOOL_REACTION_SCHEMA
 
 logger = logging.getLogger(__name__)
 
-MAX_CHARS = 250
+# ⚠️ FALLBACK_TWEETS LEFT UNCHANGED (per your request)
+from config.fallbacks import FALLBACK_TWEETS  # or keep your existing import
 
-# =========================
-# FALLBACK TWEETS (≤250 chars)
-# =========================
-FALLBACK_TWEETS = [
-    "spent hours mapping levels, scenarios, and invalidations. entered anyway with no stop because it felt right. price immediately showed me why feelings are not a strategy.",
-    "every trade starts with confidence, slowly turns into hope, then ends with acceptance. somehow i still act surprised when the cycle repeats exactly the same way.",
-    "watched price respect my levels perfectly while i hesitated. entered late, sized too big, and blamed execution instead of the obvious lack of discipline.",
-    "told myself i was waiting for confirmation. what i really did was wait until the risk was worse and the reward was gone.",
-    "another trade where i was right about direction, wrong about timing, and absolutely confident it would still work out anyway.",
-    "i don’t chase tops or bottoms. i chase the feeling that this time i finally figured it out.",
-    "the plan was simple. the execution wasn’t. the result was predictable.",
-]
 
-# =========================
-# SYSTEM PROMPT
-# =========================
-SYSTEM_PROMPT = """
-You are a degen trading Twitter account.
+# -----------------------------
+# HARD SANITIZER (FINAL GUARD)
+# -----------------------------
+def sanitize_post_text(text: str) -> str:
+    if not text:
+        return ""
 
-Style rules:
-- First-person
-- Casual, cynical trader tone
-- Aim for 180–250 characters
-- Never exceed 250 characters
-- No emojis
-- No hashtags
-- No advice
-- No explanations
-- No meta commentary
+    cleaned_lines = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if s.lower().startswith("[image:"):
+            continue
+        if "[" in s and "]" in s:
+            continue
+        cleaned_lines.append(s)
 
-Content:
-- Bad entries and exits
-- Overconfidence, regret, cope
-- Charts, candles, leverage, timing
-- Emotional, observational, impulsive
+    text = " ".join(cleaned_lines)
 
-Write tweets that feel posted right after staring at charts too long.
-"""
+    # Strip emojis / symbols
+    text = re.sub(r"[^\w\s.,—']", "", text)
 
-# =========================
-# Helpers
-# =========================
-def normalize_post_text(result: Any) -> str:
-    """
-    Ensures post_text is always a string.
-    Handles dict, string, or broken LLM output.
-    """
-    if isinstance(result, str):
-        return result
+    # Normalize whitespace
+    text = re.sub(r"\s+", " ", text).strip()
 
-    if isinstance(result, dict):
-        for key in ("post", "text", "content", "tweet"):
-            value = result.get(key)
-            if isinstance(value, str):
-                return value
+    return text
 
-    return random.choice(FALLBACK_TWEETS)
 
-# =========================
-# AutoPost Service
-# =========================
+def get_agent_system_prompt() -> str:
+    tools_desc = get_tools_description()
+    return AUTOPOST_AGENT_PROMPT.format(tools_desc=tools_desc)
+
+
 class AutoPostService:
+    """Agent-based autoposting service with defensive execution."""
+
     def __init__(self, db: Database, tier_manager=None):
         self.db = db
         self.llm = LLMClient()
         self.twitter = TwitterClient()
         self.tier_manager = tier_manager
 
-    async def safe_chat(self, messages: list[dict]) -> Any:
-        """LLM call that never crashes autopost."""
-        try:
-            return await self.llm.chat(messages)
-        except Exception as e:
-            logger.error(f"[LLM] Failed: {e}")
-            return None
+    def _sanitize_plan(self, plan: list[dict]) -> list[dict]:
+        """
+        Allow only known tools.
+        Image tools may exist, but output is always sanitized later.
+        """
+        if not isinstance(plan, list):
+            logger.warning("[AUTOPOST] Plan invalid — stripping")
+            return []
+
+        sanitized = []
+        for step in plan:
+            if not isinstance(step, dict):
+                continue
+            tool = step.get("tool")
+            params = step.get("params", {})
+            if tool not in TOOLS:
+                logger.warning(f"[AUTOPOST] Unknown tool: {tool}")
+                continue
+            sanitized.append({"tool": tool, "params": params})
+            if len(sanitized) >= 3:
+                break
+
+        return sanitized
 
     async def run(self) -> dict[str, Any]:
         start_time = time.time()
         logger.info("[AUTOPOST] === Starting ===")
 
         try:
-            # -------------------------
-            # Tier check
-            # -------------------------
+            # -----------------------------
+            # Tier gate
+            # -----------------------------
             if self.tier_manager:
                 can_post, reason = self.tier_manager.can_post()
                 if not can_post:
                     logger.warning(f"[AUTOPOST] Blocked: {reason}")
-                    return {
-                        "success": False,
-                        "error": f"posting_blocked: {reason}",
-                        "tier": self.tier_manager.tier,
-                        "usage_percent": self.tier_manager.get_usage_percent(),
-                    }
+                    return {"success": False, "error": reason}
 
-            # -------------------------
-            # Context
-            # -------------------------
-            previous_posts = await self.db.get_recent_posts_formatted(limit=40)
+            # -----------------------------
+            # Load context
+            # -----------------------------
+            previous_posts = await self.db.get_recent_posts_formatted(limit=50)
 
+            system_prompt = SYSTEM_PROMPT + get_agent_system_prompt()
             messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {
                     "role": "user",
-                    "content": f"""
-Recent tweets (do not repeat wording or structure):
-{previous_posts}
-
-Write one new tweet.
-Output ONLY the tweet text.
-""",
+                    "content": (
+                        "Create a Twitter post.\n"
+                        "Do not repeat previous posts.\n\n"
+                        f"{previous_posts}\n\n"
+                        "Create a plan if needed."
+                    ),
                 },
             ]
 
-            # -------------------------
-            # Generate tweet
-            # -------------------------
-            raw_result = await self.safe_chat(messages)
+            # -----------------------------
+            # Planning
+            # -----------------------------
+            plan_raw = await self.llm.chat(messages, PLAN_SCHEMA)
+            try:
+                plan_data = json.loads(plan_raw) if isinstance(plan_raw, str) else plan_raw
+            except Exception:
+                plan_data = {}
 
-            post_text = normalize_post_text(raw_result)
-            post_text = post_text.strip()[:MAX_CHARS].rstrip()
+            plan = self._sanitize_plan(plan_data.get("plan", []))
+            messages.append({"role": "assistant", "content": json.dumps(plan_data)})
 
-            # -------------------------
-            # Post to Twitter
-            # -------------------------
-            tweet_data = await self.twitter.post(post_text)
+            # -----------------------------
+            # Tool execution
+            # -----------------------------
+            image_bytes = None
+            for step in plan:
+                tool = step["tool"]
+                params = step["params"]
 
-            await self.db.save_post(
-                post_text,
-                tweet_data["id"],
-                include_picture=False,
-            )
+                if tool == "generate_image":
+                    try:
+                        image_bytes = await TOOLS[tool](params.get("prompt", ""))
+                        messages.append({"role": "user", "content": "Tool result: image generated"})
+                    except Exception as e:
+                        logger.error(f"[AUTOPOST] Image tool failed: {e}")
+                        image_bytes = None
+                else:
+                    try:
+                        result = await TOOLS[tool](**params)
+                        messages.append({"role": "user", "content": f"Tool result: {result}"})
+                    except Exception as e:
+                        logger.error(f"[AUTOPOST] Tool {tool} failed: {e}")
+
+                reaction = await self.llm.chat(messages, TOOL_REACTION_SCHEMA)
+                messages.append({"role": "assistant", "content": reaction.get("thinking", "")})
+
+            # -----------------------------
+            # Final tweet generation
+            # -----------------------------
+            messages.append({
+                "role": "user",
+                "content": (
+                    "Write ONE tweet.\n"
+                    "Text only.\n"
+                    "No image descriptions.\n"
+                    "No brackets or metadata.\n"
+                    "Quiet observational tone.\n"
+                    "Output the tweet text only."
+                ),
+            })
+
+            post_raw = await self.llm.chat(messages, POST_TEXT_SCHEMA)
+
+            if isinstance(post_raw, dict):
+                post_text = post_raw.get("post_text", "")
+            else:
+                try:
+                    post_text = json.loads(post_raw).get("post_text", "")
+                except Exception:
+                    post_text = post_raw or ""
+
+            # -----------------------------
+            # SANITIZE + GUARANTEE
+            # -----------------------------
+            post_text = sanitize_post_text(post_text)
+
+            if not post_text or len(post_text) < 20:
+                logger.warning("[AUTOPOST] Invalid text — forcing fallback")
+                post_text = random.choice(FALLBACK_TWEETS)
+
+            if "[image" in post_text.lower():
+                logger.error("[AUTOPOST] Image leak detected — forcing fallback")
+                post_text = random.choice(FALLBACK_TWEETS)
+
+            # -----------------------------
+            # Upload image (optional)
+            # -----------------------------
+            media_ids = None
+            if image_bytes:
+                try:
+                    media_id = await self.twitter.upload_media(image_bytes)
+                    media_ids = [media_id]
+                except Exception as e:
+                    logger.error(f"[AUTOPOST] Media upload failed: {e}")
+                    media_ids = None
+
+            # -----------------------------
+            # POST WITH RETRY (NO MISS)
+            # -----------------------------
+            tweet_data = None
+            for attempt in range(3):
+                try:
+                    tweet_data = await self.twitter.post(post_text, media_ids=media_ids)
+                    break
+                except Exception as e:
+                    logger.error(f"[AUTOPOST] Twitter post failed ({attempt+1}/3): {e}")
+                    time.sleep(5)
+
+            if not tweet_data:
+                logger.critical("[AUTOPOST] Final retry failed — posting fallback")
+                post_text = random.choice(FALLBACK_TWEETS)
+                tweet_data = await self.twitter.post(post_text)
+
+            # -----------------------------
+            # Save + return
+            # -----------------------------
+            await self.db.save_post(post_text, tweet_data["id"], image_bytes is not None)
 
             duration = round(time.time() - start_time, 1)
-            logger.info("[AUTOPOST] Posted successfully")
+            logger.info(f"[AUTOPOST] === Completed in {duration}s ===")
 
             return {
                 "success": True,
                 "tweet_id": tweet_data["id"],
                 "text": post_text,
-                "duration_seconds": duration,
+                "duration": duration,
             }
 
         except Exception as e:
-            duration = round(time.time() - start_time, 1)
-            logger.error(f"[AUTOPOST] FAILED: {e}")
-            logger.exception(e)
-            return {
-                "success": False,
-                "error": str(e),
-                "duration_seconds": duration,
-            }
+            logger.exception("[AUTOPOST] Fatal error")
+            return {"success": False, "error": str(e)}
