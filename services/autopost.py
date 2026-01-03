@@ -1,22 +1,19 @@
-
 """
 Autopost service — Degen trading persona
 
 - Text-only LLM usage (OpenRouter-safe)
-- No response_format / no schemas
-- Target length: 180–250 chars
-- Hard clamp at 250 chars
 - Guaranteed fallback
+- Hard clamp at 250 chars
 """
 
 import logging
 import time
 import random
-from typing import Any
+from typing import Any, List, Optional
 
 from services.database import Database
 from services.llm import LLMClient
-from services.twitter import TwitterClient
+from tweepy import Client, TweepyException
 
 logger = logging.getLogger(__name__)
 
@@ -62,23 +59,63 @@ Write tweets that feel posted right after staring at charts too long.
 """
 
 # =========================
-# Helpers
+# Helper: normalize post text
 # =========================
 def normalize_post_text(result: Any) -> str:
     """
     Ensures post_text is always a string.
     Handles dict, string, or broken LLM output.
     """
-    if isinstance(result, str):
-        return result
+    if isinstance(result, str) and result.strip():
+        return result.strip()
 
     if isinstance(result, dict):
         for key in ("post", "text", "content", "tweet"):
             value = result.get(key)
-            if isinstance(value, str):
-                return value
+            if isinstance(value, str) and value.strip():
+                return value.strip()
 
+    # fallback if nothing usable
     return random.choice(FALLBACK_TWEETS)
+
+# =========================
+# Twitter client
+# =========================
+class TwitterClient:
+    def __init__(self):
+        # Replace with your credentials
+        self.client = Client(
+            bearer_token="YOUR_BEARER_TOKEN",
+            consumer_key="YOUR_CONSUMER_KEY",
+            consumer_secret="YOUR_CONSUMER_SECRET",
+            access_token="YOUR_ACCESS_TOKEN",
+            access_token_secret="YOUR_ACCESS_SECRET",
+            wait_on_rate_limit=True,
+        )
+
+    async def post(self, text: Optional[str] = None, media_ids: Optional[List[str]] = None) -> dict:
+        """
+        Safely posts a tweet.
+        Raises ValueError if both text and media are empty.
+        Returns Twitter API response dict.
+        """
+        text = (text or "").strip()
+        media_ids = media_ids or []
+
+        if not text and not media_ids:
+            logger.error("Attempted to post empty tweet: text and media are both empty")
+            raise ValueError("Cannot post empty tweet: must provide text or media")
+
+        try:
+            response = self.client.create_tweet(
+                text=text if text else None,
+                media_ids=media_ids if media_ids else None,
+            )
+            logger.info(f"[TWITTER] Tweet posted successfully: {response.data.get('id')}")
+            return response.data or {}
+        except TweepyException as e:
+            logger.error(f"[TWITTER] Failed to post tweet: {e}")
+            raise
 
 # =========================
 # AutoPost Service
@@ -140,15 +177,27 @@ Output ONLY the tweet text.
             # Generate tweet
             # -------------------------
             raw_result = await self.safe_chat(messages)
-
             post_text = normalize_post_text(raw_result)
-            post_text = post_text.strip()[:MAX_CHARS].rstrip()
+
+            # Ensure non-empty string
+            post_text = (post_text or "").strip()
+            if not post_text:
+                post_text = random.choice(FALLBACK_TWEETS)
+                logger.warning("[AUTOPOST] LLM returned empty, using fallback tweet.")
+
+            # Clamp length
+            post_text = post_text[:MAX_CHARS].rstrip()
 
             # -------------------------
             # Post to Twitter
             # -------------------------
             tweet_data = await self.twitter.post(post_text)
+            if not tweet_data or "id" not in tweet_data:
+                raise RuntimeError("Twitter post returned invalid response")
 
+            # -------------------------
+            # Save to DB
+            # -------------------------
             await self.db.save_post(
                 post_text,
                 tweet_data["id"],
@@ -156,7 +205,7 @@ Output ONLY the tweet text.
             )
 
             duration = round(time.time() - start_time, 1)
-            logger.info("[AUTOPOST] Posted successfully")
+            logger.info(f"[AUTOPOST] Posted successfully in {duration}s")
 
             return {
                 "success": True,
